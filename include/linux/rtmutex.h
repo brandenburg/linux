@@ -21,13 +21,15 @@ extern int max_lock_depth; /* for sysctl */
 /**
  * The rt_mutex structure
  *
- * @wait_lock:	spinlock to protect the structure
- * @wait_list:	pilist head to enqueue waiters in priority order
- * @owner:	the mutex owner
+ * @wait_lock:		spinlock to protect the structure
+ * @wait_list:		pilist head to enqueue waiters in priority order
+ * @topmask_list:	pilist head to track mPI-"top"-waiters
+ * @owner:		the mutex owner
  */
 struct rt_mutex {
 	raw_spinlock_t		wait_lock;
 	struct plist_head	wait_list;
+	struct plist_head	topmask_list;
 	struct task_struct	*owner;
 #ifdef CONFIG_DEBUG_RT_MUTEXES
 	int			save_state;
@@ -39,6 +41,25 @@ struct rt_mutex {
 
 struct rt_mutex_waiter;
 struct hrtimer_sleeper;
+
+/*
+ * Generic Migratory Priority Inheritance eligibility tuple.
+ *
+ * Cache <priority, mask> of top-mask waiters, and
+ * <priority, broadest mask> for the squashed_mask_list of
+ * waiters blocked on a lock owner task.
+ */
+struct rt_mutex_etuple {
+	/* cached priority */
+	unsigned int		prio;
+	/* cached (possibly broadest) affinity */
+	struct cpumask		mask;
+	/* pi node to enqueue the tuple in:
+	 * 	- top-mask list on rt_mutex
+	 *	- squashed mask list on lock-owner
+	 */
+	struct plist_node	etuple_entry;
+};
 
 #ifdef CONFIG_DEBUG_RT_MUTEXES
  extern int rt_mutex_debug_check_no_locks_freed(const void *from,

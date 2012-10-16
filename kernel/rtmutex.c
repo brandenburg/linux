@@ -15,6 +15,8 @@
 #include <linux/sched.h>
 #include <linux/timer.h>
 
+#include <linux/slab.h>
+
 #include "rtmutex_common.h"
 
 /*
@@ -112,6 +114,11 @@ int rt_mutex_getprio(struct task_struct *task)
  */
 static void __rt_mutex_adjust_prio(struct task_struct *task)
 {
+	/* FIXME:
+	 * Migratory priority inheritance logic:
+	 * Check if we can inherit some priority from a higher prio task
+	 * eligible to execute on this CPU
+	 */
 	int prio = rt_mutex_getprio(task);
 
 	if (task->prio != prio)
@@ -134,6 +141,117 @@ static void rt_mutex_adjust_prio(struct task_struct *task)
 	raw_spin_lock_irqsave(&task->pi_lock, flags);
 	__rt_mutex_adjust_prio(task);
 	raw_spin_unlock_irqrestore(&task->pi_lock, flags);
+}
+
+static void allocate_and_init_etuple(struct rt_mutex_etuple **tuple,
+				     unsigned int prio,
+				     const struct cpumask *mask)
+{
+	struct rt_mutex_etuple *et;
+	et = kmalloc(sizeof(struct rt_mutex_etuple), GFP_ATOMIC);
+
+	et->prio = prio;
+	cpumask_copy(&et->mask, mask);
+	plist_node_init(&et->etuple_entry, prio);
+
+	tuple = &et;
+	return;
+}
+
+static void deallocate_etuple(struct rt_mutex_etuple *tuple)
+{
+	kfree(tuple);
+}
+
+/* call it with pi_lock and wait_lock */
+static int is_topmask_waiter(struct task_struct *task,
+			     struct rt_mutex *lock)
+{
+	struct cpumask *mask = &task->cpus_allowed;
+	cpumask_t tmpmask;
+	unsigned int prio = task->prio;
+	struct rt_mutex_etuple *et;
+
+	/* easy case, no other waiters */
+	if (plist_head_empty(&lock->topmask_list))
+		return 1;
+
+	et = plist_first_entry(&lock->topmask_list,
+			struct rt_mutex_etuple, etuple_entry);
+
+	/* top-waiter -> surely a top-mask waiter */
+	if (prio > et->prio)
+		return 1;
+
+	cpumask_clear(&tmpmask);
+	/*
+	 * while (lock->topmask_list not empty) {
+	 *	elem = get_next();
+	 *	if (elem->prio < prio)
+	 *		if (mask completely included in tmpmask)
+	 *			return 0;
+	 *		return 1
+	 *	tmpmask += elem->mask;
+	 * }
+	 *
+	 * FIXME: we actually don't use the above first element
+	 */
+	plist_for_each_entry(et, &lock->topmask_list, etuple_entry) {
+		if (et->prio < prio) {
+			if (cpumask_subset(mask, &tmpmask))
+				return 0;
+			else
+				return 1;
+		}
+
+		cpumask_or(&tmpmask, &tmpmask, &et->mask);
+	}
+
+	return 0;
+}
+
+static struct rt_mutex_etuple* get_etuple_for_prio(struct task_struct *task,
+						   unsigned int prio)
+{
+	/* return the squashed_mask_list etuple at level prio */
+	return NULL;
+}
+
+/* call it with pi_lock and wait_lock */
+static void update_squashed_mask(struct task_struct *task,
+				 unsigned int prio,
+				 struct cpumask *mask)
+{
+	struct rt_mutex_etuple *sm_tuple = NULL;
+
+	if (!(&task->squashed_mask_list)) {
+		plist_head_init(&task->squashed_mask_list);
+		allocate_and_init_etuple(&sm_tuple, prio, mask);
+		plist_add(&sm_tuple->etuple_entry, &task->squashed_mask_list);
+		goto out;
+	}
+
+	/* waiters already there: get the tuple */
+	sm_tuple = get_etuple_for_prio(task, prio);
+	/* update the broadest mask for the prio-level */
+	cpumask_or(&sm_tuple->mask, &sm_tuple->mask, mask);
+out:
+	return;
+}
+
+/* call it with pi_lock and wait_lock */
+static void recompute_squashed_mask(struct task_struct *task)
+{
+	/* forall pi_waiters */
+	/* get pi_waiters->lock->topmask_list */
+	/* build squashed_mask_list (pi, mask)
+	 * similarly to "update_squashed_mask()"
+	 */
+	/* FIXME:
+	 * delete the current squashed and tuples
+	 * create the new ones
+	 */
+	return;
 }
 
 /*
@@ -357,6 +475,14 @@ static int try_to_take_rt_mutex(struct rt_mutex *lock, struct task_struct *task,
 		if (waiter) {
 			plist_del(&waiter->list_entry, &lock->wait_list);
 			task->pi_blocked_on = NULL;
+			/* remove a top-mask waiter */
+			if (!waiter->etuple) {
+				struct rt_mutex_etuple *et = waiter->etuple;
+				plist_del(&et->etuple_entry,
+						&lock->topmask_list);
+				waiter->etuple = NULL;
+				deallocate_etuple(et);
+			}
 		}
 
 		/*
@@ -375,6 +501,12 @@ static int try_to_take_rt_mutex(struct rt_mutex *lock, struct task_struct *task,
 	debug_rt_mutex_lock(lock);
 
 	rt_mutex_set_owner(lock, task);
+
+	/* (re)evaluate the squashed mask:
+	 * we acquired the lock
+	 * FIXME: locking.
+	 */
+	recompute_squashed_mask(task);
 
 	rt_mutex_deadlock_account_lock(lock, task);
 
@@ -409,6 +541,24 @@ static int task_blocks_on_rt_mutex(struct rt_mutex *lock,
 	if (rt_mutex_has_waiters(lock))
 		top_waiter = rt_mutex_top_waiter(lock);
 	plist_add(&waiter->list_entry, &lock->wait_list);
+
+	/* If the task is a top-mask waiter, add it to the list
+	 * and update the squashed_mask_list in the owner */
+	if (is_topmask_waiter(task, lock)) {
+		struct rt_mutex_etuple *etuple = NULL;
+		allocate_and_init_etuple(&etuple,
+				task->prio, &task->cpus_allowed);
+
+		/* add tuple to top-mask waiters */
+		plist_node_init(&etuple->etuple_entry, task->prio);
+		plist_add(&etuple->etuple_entry, &lock->topmask_list);
+
+		waiter->etuple = etuple;
+
+		update_squashed_mask(owner, task->prio, &task->cpus_allowed);
+	} else {
+		waiter->etuple = NULL;
+	}
 
 	task->pi_blocked_on = waiter;
 
@@ -474,7 +624,23 @@ static void wakeup_next_waiter(struct rt_mutex *lock)
 	 */
 	plist_del(&waiter->pi_list_entry, &current->pi_waiters);
 
+	/*
+	 * Migratory prio inheritance:
+	 * remove waiter from top-mask-list
+	 */
+	if (waiter->etuple) {
+		struct rt_mutex_etuple *etuple = waiter->etuple;
+
+		plist_del(&etuple->etuple_entry, &lock->topmask_list);
+		waiter->etuple = NULL;
+
+		deallocate_etuple(etuple);
+	}
+
 	rt_mutex_set_owner(lock, NULL);
+
+	/* lock is released, recompute the squashed mask */
+	recompute_squashed_mask(current);
 
 	raw_spin_unlock_irqrestore(&current->pi_lock, flags);
 
@@ -891,6 +1057,7 @@ void __rt_mutex_init(struct rt_mutex *lock, const char *name)
 	lock->owner = NULL;
 	raw_spin_lock_init(&lock->wait_lock);
 	plist_head_init(&lock->wait_list);
+	plist_head_init(&lock->topmask_list);
 
 	debug_rt_mutex_init(lock, name);
 }

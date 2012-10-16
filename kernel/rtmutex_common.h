@@ -42,11 +42,13 @@ extern void schedule_rt_mutex_test(struct rt_mutex *lock);
  *
  * @list_entry:		pi node to enqueue into the mutex waiters list
  * @pi_list_entry:	pi node to enqueue into the mutex owner waiters list
+ * @etuple:		migratory priority inheritance tuple for top-mask list
  * @task:		task reference to the blocked task
  */
 struct rt_mutex_waiter {
 	struct plist_node	list_entry;
 	struct plist_node	pi_list_entry;
+	struct rt_mutex_etuple	*etuple;
 	struct task_struct	*task;
 	struct rt_mutex		*lock;
 #ifdef CONFIG_DEBUG_RT_MUTEXES

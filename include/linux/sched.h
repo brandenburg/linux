@@ -1435,6 +1435,8 @@ struct task_struct {
 #ifdef CONFIG_RT_MUTEXES
 	/* PI waiters blocked on a rt_mutex held by this task */
 	struct plist_head pi_waiters;
+	/* mPI top-mask-waiters contributing to priority on some processor */
+	struct plist_head squashed_mask_list;
 	/* Deadlock detection and priority inheritance handling */
 	struct rt_mutex_waiter *pi_blocked_on;
 #endif
