@@ -82,6 +82,8 @@ void init_rt_rq(struct rt_rq *rt_rq, struct rq *rq)
 	rt_rq->rt_throttled = 0;
 	rt_rq->rt_runtime = 0;
 	raw_spin_lock_init(&rt_rq->rt_runtime_lock);
+
+	INIT_LIST_HEAD(&rt_rq->inheriting_list);
 }
 
 #ifdef CONFIG_RT_GROUP_SCHED
@@ -1088,12 +1090,20 @@ void dec_rt_tasks(struct sched_rt_entity *rt_se, struct rt_rq *rt_rq)
 	dec_rt_group(rt_se, rt_rq);
 }
 
+static inline int is_migratory_rt_task(struct sched_rt_entity *rt_se)
+{
+	struct task_struct *t = rt_task_of(rt_se);
+	return (&t->squashed_mask_list != NULL);
+}
+
 static void __enqueue_rt_entity(struct sched_rt_entity *rt_se, bool head)
 {
 	struct rt_rq *rt_rq = rt_rq_of_se(rt_se);
 	struct rt_prio_array *array = &rt_rq->active;
 	struct rt_rq *group_rq = group_rt_rq(rt_se);
 	struct list_head *queue = array->queue + rt_se_prio(rt_se);
+	/* Migrtory priority inheritance inheriting list */
+	struct list_head *in_queue = &rt_rq->inheriting_list;
 
 	/*
 	 * Don't enqueue the group if its throttled, or when empty.
@@ -1114,6 +1124,12 @@ static void __enqueue_rt_entity(struct sched_rt_entity *rt_se, bool head)
 	__set_bit(rt_se_prio(rt_se), array->bitmap);
 
 	inc_rt_tasks(rt_se, rt_rq);
+
+	/* manage inheriting list */
+	if (is_migratory_rt_task(rt_se)) {
+		rt_se->on_inherit_list = 1;
+		list_add_tail(&rt_se->inherit_list, in_queue);
+	}
 }
 
 static void __dequeue_rt_entity(struct sched_rt_entity *rt_se)
@@ -1128,6 +1144,12 @@ static void __dequeue_rt_entity(struct sched_rt_entity *rt_se)
 	dec_rt_tasks(rt_se, rt_rq);
 	if (!rt_rq->rt_nr_running)
 		list_del_leaf_rt_rq(rt_rq);
+
+	/* remove it from the inheriting list */
+	if (rt_se->on_inherit_list) {
+		list_del_init(&rt_se->inherit_list);
+		rt_se->on_inherit_list = 0;
+	}
 }
 
 /*
@@ -1706,8 +1728,102 @@ out:
 	return ret;
 }
 
+static int __push_migratory_task(struct task_struct *next, struct rq *rq)
+{
+	struct rq *lowest_rq;
+	struct rt_mutex_etuple *et;
+	int ret = 0;
+
+	plist_for_each_entry(et, &next->squashed_mask_list, etuple_entry) {
+		/* update with current best try */
+		next->prio = et->prio;
+		cpumask_copy(&next->cpus_allowed, &et->mask);
+
+		/* prepare for migration */
+		get_task_struct(next);
+
+		/* find_lock_lowest_rq locks the rq if found */
+		lowest_rq = find_lock_lowest_rq(next, rq);
+		if (!lowest_rq) {
+			/* If find_lock_lowest_rq failed to find a
+			 * suitable CPU, we simply keep it here until
+			 * selected by e.g., a pull
+			 */
+
+			/* If a pull migrated it, no need to restore
+			 * the original prio and mask values,
+			 * just return success
+			 */
+			if (task_cpu(next) != rq->cpu)
+				ret = 1;
+
+			/* bad luck, keep it here and restore the backup */
+			goto out;
+		}
+
+		/* will remove from the inherit */
+		deactivate_task(rq, next, 0);
+		set_task_cpu(next, lowest_rq->cpu);
+		activate_task(lowest_rq, next, 0);
+		ret = 1;
+
+		resched_task(lowest_rq->curr);
+
+		double_unlock_balance(rq, lowest_rq);
+
+out:
+		put_task_struct(next);
+
+		if (ret)
+			break;
+	}
+
+	return ret;
+}
+
+/*
+ * Consider all tasks in the inheriting_list and tries to
+ * migrate them on CPUs where they may (perhaps) run
+ */
+static void push_migratory_tasks(struct rq *rq)
+{
+	struct rt_rq *rt_rq = &rq->rt;
+
+	struct task_struct *next;
+	struct sched_rt_entity *rt_se;
+
+	unsigned int prev_prio;
+	cpumask_t prev_mask;
+
+	/* No tasks? Nothing to do */
+	if (list_empty(&rt_rq->inheriting_list))
+		return;
+
+	/*
+	 * The push logic is similar as the above push_rt_task
+	 */
+	list_for_each_entry(rt_se, &rt_rq->inheriting_list, inherit_list) {
+		next = rt_task_of(rt_se);
+
+		/* save previous values */
+		prev_prio = next->prio;
+		cpumask_copy(&prev_mask, &next->cpus_allowed);
+
+		/* pick the next if successfully migrated */
+		if (__push_migratory_task(next, rq))
+			continue;
+
+		/* otherwise restore backup */
+		next->prio = prev_prio;
+		cpumask_copy(&next->cpus_allowed, &prev_mask);
+	}
+}
+
 static void push_rt_tasks(struct rq *rq)
 {
+	/* manage migratory tasks first */
+	push_migratory_tasks(rq);
+
 	/* push_rt_task will return true if it moved an RT */
 	while (push_rt_task(rq))
 		;
@@ -1794,6 +1910,9 @@ skip:
 
 static void pre_schedule_rt(struct rq *rq, struct task_struct *prev)
 {
+	/* FIXME:
+	 * pull_migratory_task(rq)
+	 */
 	/* Try to pull RT tasks here if we lower this rq's prio */
 	if (rq->rt.highest_prio.curr > prev->prio)
 		pull_rt_task(rq);

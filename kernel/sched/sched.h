@@ -307,6 +307,8 @@ struct rt_rq {
 	struct list_head leaf_rt_rq_list;
 	struct task_group *tg;
 #endif
+	/* migratory priority inheritance list */
+	struct list_head inheriting_list;
 };
 
 #ifdef CONFIG_SMP

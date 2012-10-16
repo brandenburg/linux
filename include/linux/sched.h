@@ -1207,6 +1207,11 @@ struct sched_rt_entity {
 	unsigned int time_slice;
 
 	struct sched_rt_entity *back;
+	/* Migratory priority inheritance handle
+	 * to enqueue on inheriting_list */
+	struct list_head inherit_list;
+	/* signal presence on the inheritance list */
+	unsigned int on_inherit_list;
 #ifdef CONFIG_RT_GROUP_SCHED
 	struct sched_rt_entity	*parent;
 	/* rq on which this entity is (to be) queued: */
@@ -1274,6 +1279,8 @@ struct task_struct {
 	unsigned int policy;
 	int nr_cpus_allowed;
 	cpumask_t cpus_allowed;
+	/* FIXME migratory priority inheritance:
+	 * need a base affinity mask */
 
 #ifdef CONFIG_PREEMPT_RCU
 	int rcu_read_lock_nesting;

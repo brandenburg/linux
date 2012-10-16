@@ -167,6 +167,8 @@ extern struct task_group root_task_group;
 	.rt		= {						\
 		.run_list	= LIST_HEAD_INIT(tsk.rt.run_list),	\
 		.time_slice	= RR_TIMESLICE,				\
+		.inherit_list	= LIST_HEAD_INIT(tsk.rt.inherit_list),	\
+		.on_inherit_list = 0,					\
 	},								\
 	.tasks		= LIST_HEAD_INIT(tsk.tasks),			\
 	INIT_PUSHABLE_TASKS(tsk)					\
