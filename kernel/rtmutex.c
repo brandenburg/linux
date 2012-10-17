@@ -624,19 +624,6 @@ static void wakeup_next_waiter(struct rt_mutex *lock)
 	 */
 	plist_del(&waiter->pi_list_entry, &current->pi_waiters);
 
-	/*
-	 * Migratory prio inheritance:
-	 * remove waiter from top-mask-list
-	 */
-	if (waiter->etuple) {
-		struct rt_mutex_etuple *etuple = waiter->etuple;
-
-		plist_del(&etuple->etuple_entry, &lock->topmask_list);
-		waiter->etuple = NULL;
-
-		deallocate_etuple(etuple);
-	}
-
 	rt_mutex_set_owner(lock, NULL);
 
 	/* lock is released, recompute the squashed mask */
