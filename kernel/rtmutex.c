@@ -428,6 +428,7 @@ static int rt_mutex_adjust_prio_chain(struct task_struct *task,
 static int try_to_take_rt_mutex(struct rt_mutex *lock, struct task_struct *task,
 		struct rt_mutex_waiter *waiter)
 {
+	unsigned long flags;
 	/*
 	 * We have to be careful here if the atomic speedups are
 	 * enabled, such that, when
@@ -466,7 +467,6 @@ static int try_to_take_rt_mutex(struct rt_mutex *lock, struct task_struct *task,
 	}
 
 	if (waiter || rt_mutex_has_waiters(lock)) {
-		unsigned long flags;
 		struct rt_mutex_waiter *top;
 
 		raw_spin_lock_irqsave(&task->pi_lock, flags);
@@ -502,11 +502,12 @@ static int try_to_take_rt_mutex(struct rt_mutex *lock, struct task_struct *task,
 
 	rt_mutex_set_owner(lock, task);
 
+	raw_spin_lock_irqsave(&task->pi_lock, flags);
 	/* (re)evaluate the squashed mask:
 	 * we acquired the lock
-	 * FIXME: locking.
 	 */
 	recompute_squashed_mask(task);
+	raw_spin_unlock_irqrestore(&task->pi_lock, flags);
 
 	rt_mutex_deadlock_account_lock(lock, task);
 
@@ -650,16 +651,29 @@ static void remove_waiter(struct rt_mutex *lock,
 
 	raw_spin_lock_irqsave(&current->pi_lock, flags);
 	plist_del(&waiter->list_entry, &lock->wait_list);
+	/*
+	 * Migratory prio inheritance:
+	 * remove waiter from top-mask-list
+	 */
+	if (waiter->etuple) {
+		struct rt_mutex_etuple *etuple = waiter->etuple;
+
+		plist_del(&etuple->etuple_entry, &lock->topmask_list);
+		waiter->etuple = NULL;
+
+		deallocate_etuple(etuple);
+	}
 	current->pi_blocked_on = NULL;
 	raw_spin_unlock_irqrestore(&current->pi_lock, flags);
 
 	if (!owner)
 		return;
 
+	/* lock is released, recompute the squashed mask */
+	raw_spin_lock_irqsave(&owner->pi_lock, flags);
+	recompute_squashed_mask(owner);
+
 	if (first) {
-
-		raw_spin_lock_irqsave(&owner->pi_lock, flags);
-
 		plist_del(&waiter->pi_list_entry, &owner->pi_waiters);
 
 		if (rt_mutex_has_waiters(lock)) {
@@ -672,9 +686,9 @@ static void remove_waiter(struct rt_mutex *lock,
 
 		if (owner->pi_blocked_on)
 			chain_walk = 1;
-
-		raw_spin_unlock_irqrestore(&owner->pi_lock, flags);
 	}
+
+	raw_spin_unlock_irqrestore(&owner->pi_lock, flags);
 
 	WARN_ON(!plist_node_empty(&waiter->pi_list_entry));
 
